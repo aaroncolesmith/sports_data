@@ -6,7 +6,7 @@ import time
 
 # Ensure we can import utils
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from utils import get_todays_games, filter_data_on_change, SPORT_INFO
+from utils import get_todays_games, get_complete_game_results, filter_data_on_change, SPORT_INFO
 
 HEADERS = {
     'Authority': 'api.actionnetwork',
@@ -16,6 +16,7 @@ HEADERS = {
 }
 
 DATA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '../data/bets_db'))
+RESULTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '../data/results'))
 
 def process_sport(sport, dates_or_weeks):
     print(f"\nProcessing {sport}...")
@@ -50,18 +51,6 @@ def process_sport(sport, dates_or_weeks):
 
     # Add timestamp
     df_new['date_scraped'] = datetime.datetime.now()
-    
-    # Filter for scheduled games (like in the template)
-    # But user asked to pull data and save on changes. 
-    # If we filter only scheduled, we miss completed game results updates if they matter.
-    # However, keeping it consistent with the template:
-    if 'status' in df_new.columns:
-        df_new = df_new.loc[df_new['status'] == 'scheduled']
-    
-    if df_new.empty:
-        print(f"No scheduled games found for {sport}.")
-        return
-
     print(f"Found {len(df_new)} new rows.")
     
     # Concatenate
@@ -100,29 +89,67 @@ def process_sport(sport, dates_or_weeks):
     filtered_df.to_csv(db_path, index=False)
 
 
+def process_results(sport, dates_or_weeks):
+    """Fetch completed game results and upsert into data/results/{sport}_results_db.csv."""
+    print(f"\nFetching completed results for {sport}...")
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+
+    results_path = os.path.join(RESULTS_DIR, f'{sport}_results_db.csv')
+
+    if os.path.exists(results_path):
+        try:
+            df_existing = pd.read_csv(results_path)
+        except Exception as e:
+            print(f"Error reading existing results for {sport}: {e}")
+            df_existing = pd.DataFrame()
+    else:
+        df_existing = pd.DataFrame()
+
+    try:
+        df_new = get_complete_game_results(sport, dates_or_weeks, HEADERS)
+    except Exception as e:
+        print(f"Error fetching results for {sport}: {e}")
+        return
+
+    if df_new is None or df_new.empty:
+        print(f"No completed games found for {sport}.")
+        return
+
+    df_new['date_scraped'] = datetime.datetime.now()
+    df_combined = pd.concat([df_existing, df_new], ignore_index=True)
+    # Keep the most recent scrape for each game
+    df_combined = df_combined.drop_duplicates(subset=['game_id'], keep='last')
+
+    print(f"Saving {len(df_combined)} result rows for {sport} (was {len(df_existing)})")
+    df_combined.to_csv(results_path, index=False)
+
+
 def main():
-    # Date-based sports
     today = datetime.date.today()
     date_format = '%Y%m%d'
-    # Look back 1 day, forward 3 days
-    dates = [(today + datetime.timedelta(days=i)).strftime(date_format) for i in range(-1, 4)]
-    
+
+    # Odds tracking: look back 7 days (catches recently completed games) and forward 3 days
+    odds_dates = [(today + datetime.timedelta(days=i)).strftime(date_format) for i in range(-7, 4)]
+    # Results: look back 14 days to ensure we don't miss any completions
+    results_dates = [(today + datetime.timedelta(days=i)).strftime(date_format) for i in range(-14, 1)]
+
     date_sports = ['nba', 'ncaab', 'soccer', 'mlb']
-    
+
     for sport in date_sports:
         if sport in SPORT_INFO:
-            process_sport(sport, dates)
+            process_sport(sport, odds_dates)
+            process_results(sport, results_dates)
         else:
             print(f"Skipping {sport} (not in SPORT_INFO)")
 
-    # Week-based sports
-    # Assuming current time frame implies late season
-    weeks = [15, 16, 17, 18]
+    # Week-based sports: cover full season range (reg season + playoffs)
+    all_weeks = list(range(1, 23))
     week_sports = ['nfl', 'ncaaf']
-    
+
     for sport in week_sports:
         if sport in SPORT_INFO:
-            process_sport(sport, weeks)
+            process_sport(sport, all_weeks)
+            process_results(sport, all_weeks)
         else:
             print(f"Skipping {sport} (not in SPORT_INFO)")
 
